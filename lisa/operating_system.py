@@ -614,6 +614,12 @@ class Debian(Linux):
         r"(?P<patch>[0-9]+)"  # patch
         r"-(?P<build>[a-zA-Z0-9-_\.~+]+)"  # build
     )
+    # please check the package name and repo are correct or not.
+    # E: There were unauthenticated packages and -y was used without
+    # --allow-unauthenticated
+    _debian_package_install_unauthenticated_regex = re.compile(
+        r"There were unauthenticated packages", re.IGNORECASE
+    )
     # apt-cache policy git
     # git:
     #   Installed: 1:2.17.1-1ubuntu0.9
@@ -794,6 +800,13 @@ class Debian(Linux):
         install_result = self._node.execute(
             command, shell=True, sudo=True, timeout=timeout
         )
+        if self._debian_package_install_unauthenticated_regex.search(
+            install_result.stdout
+        ):
+            command += " --allow-unauthenticated"
+            install_result = self._node.execute(
+                command, shell=True, sudo=True, timeout=timeout
+            )
         # get error lines.
         if install_result.exit_code != 0:
             install_result.assert_exit_code(
