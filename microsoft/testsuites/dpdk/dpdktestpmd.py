@@ -2,6 +2,8 @@
 # Licensed under the MIT license.
 
 import re
+from functools import partial
+from pathlib import PurePosixPath
 from typing import List, Pattern, Tuple, Type, Union
 
 from assertpy import assert_that, fail
@@ -9,9 +11,29 @@ from semver import VersionInfo
 
 from lisa.executable import Tool
 from lisa.nic import NicInfo
-from lisa.operating_system import Debian, Fedora, Redhat, Suse, Ubuntu
-from lisa.tools import Echo, Git, Lscpu, Lspci, Modprobe, Service, Tar, Wget
-from lisa.util import LisaException, SkippedException, UnsupportedDistroException
+from lisa.node import Node
+from lisa.operating_system import Debian, Fedora, Oracle, Redhat, Suse, Ubuntu
+from lisa.tools import (
+    Echo,
+    Git,
+    Kill,
+    Lscpu,
+    Lspci,
+    Modprobe,
+    Pidof,
+    Service,
+    Tar,
+    Unzip,
+    Wget,
+)
+from lisa.util import (
+    LisaException,
+    MissingPackagesException,
+    SkippedException,
+    UnsupportedDistroException,
+)
+from lisa.util.parallel import TaskManager, run_in_parallel_async
+from lisa.util.perf_timer import create_timer
 
 PACKAGE_MANAGER_SOURCE = "package_manager"
 
@@ -44,7 +66,7 @@ class DpdkTestpmd(Tool):
     def command(self) -> str:
         return self._testpmd_install_path
 
-    _testpmd_install_path = "/usr/local/bin/dpdk-testpmd"
+    _testpmd_install_path = ""
     _ubuntu_packages_1804 = [
         "librdmacm-dev",
         "build-essential",
@@ -81,7 +103,6 @@ class DpdkTestpmd(Tool):
 
     _redhat_packages = [
         "psmisc",
-        "kernel-devel-$(uname -r)",
         "numactl-devel.x86_64",
         "librdmacm-devel",
         "pkgconfig",
@@ -121,8 +142,19 @@ class DpdkTestpmd(Tool):
     def set_dpdk_branch(self, dpdk_branch: str) -> None:
         self._dpdk_branch = dpdk_branch
 
-    def get_dpdk_branch(self) -> VersionInfo:
+    def get_dpdk_version(self) -> VersionInfo:
         return self._dpdk_version_info
+
+    def has_tx_ip_flag(self) -> bool:
+        dpdk_version = self.get_dpdk_version()
+        if not dpdk_version:
+            fail(
+                "Test suite bug: dpdk version was not set prior "
+                "to querying the version information."
+            )
+
+        # black doesn't like to direct return VersionInfo comparison
+        return bool(dpdk_version >= "19.11.0")  # appease the type checker
 
     def use_package_manager_install(self) -> bool:
         assert_that(hasattr(self, "_dpdk_source")).described_as(
@@ -251,29 +283,42 @@ class DpdkTestpmd(Tool):
     def run_for_n_seconds(self, cmd: str, timeout: int) -> str:
         self._last_run_timeout = timeout
         self.node.log.info(f"{self.node.name} running: {cmd}")
-        self.timer_proc = self.node.execute_async(
-            f"sleep {timeout} && killall -s INT {cmd.split()[0]}",
-            sudo=True,
-            shell=True,
-        )
+
+        # run testpmd async
         testpmd_proc = self.node.execute_async(
             cmd,
             sudo=True,
         )
-        self.timer_proc.wait_result()
+
+        # setup a timer
+        self.killer = create_async_timeout(self.node, self.command, timeout)
+
+        # wait for killer to finish (or be canceled)
+        self.killer.wait_for_all_workers()
         proc_result = testpmd_proc.wait_result()
         self._last_run_output = proc_result.stdout
         self.populate_performance_data()
         return proc_result.stdout
 
+    def check_testpmd_is_running(self) -> bool:
+        pids = self.node.tools[Pidof].get_pids(self.command, sudo=True)
+        return len(pids) > 0
+
     def kill_previous_testpmd_command(self) -> None:
-        # kill testpmd early, then kill the timer proc that is still running
-        assert_that(self.timer_proc).described_as(
-            "Timer process was not initialized before "
-            "calling kill_previous_testpmd_command"
-        ).is_not_none()
-        self.node.execute(f"killall -s INT {self.command}", sudo=True, shell=True)
-        self.timer_proc.kill()
+        # kill testpmd early
+        if not hasattr(self, "killer"):
+            fail(
+                "Test Suite Error: kill_previous_testpmd_command was called"
+                " but there was no task killer registered."
+            )
+        # cancel the scheduled killer
+        self.killer.cancel()
+        # and kill immediately
+        self.node.tools[Kill].by_name(self.command)
+        if self.check_testpmd_is_running():
+            raise LisaException(
+                "Testpmd is not responding to signals, failing the test."
+            )
 
     def get_data_from_testpmd_output(
         self,
@@ -410,14 +455,11 @@ class DpdkTestpmd(Tool):
 
             self._dpdk_version_info = node.os.get_package_information("dpdk")
 
-            if self._dpdk_version_info >= "19.11.0":
-                self._testpmd_install_path = "dpdk-testpmd"
-            else:
-                self._testpmd_install_path = "testpmd"
             self.node.log.info(
                 f"Installed DPDK version {str(self._dpdk_version_info)} "
                 "from package manager"
             )
+            self.find_testpmd_binary()
             self._load_drivers_for_dpdk()
             return True
 
@@ -425,8 +467,10 @@ class DpdkTestpmd(Tool):
         self.node.log.info(f"Installing dpdk from source: {self._dpdk_source}")
         self._dpdk_repo_path_name = "dpdk"
         self.dpdk_path = self.node.working_path.joinpath(self._dpdk_repo_path_name)
-        result = self.node.execute("which dpdk-testpmd")
-        if result.exit_code == 0:  # tools are already installed
+
+        if self.find_testpmd_binary(
+            assert_on_fail=False
+        ):  # tools are already installed
             return True
         git_tool = node.tools[Git]
         echo_tool = node.tools[Echo]
@@ -498,7 +542,7 @@ class DpdkTestpmd(Tool):
         node.execute(
             "ninja",
             cwd=self.dpdk_build_path,
-            timeout=1200,
+            timeout=1800,
             expected_exit_code=0,
             expected_exit_code_failure_message=(
                 "ninja build for dpdk failed. check build spew for missing headers "
@@ -532,6 +576,8 @@ class DpdkTestpmd(Tool):
             append=True,
         )
 
+        self.find_testpmd_binary(check_path="/usr/local/bin")
+
         return True
 
     def _load_drivers_for_dpdk(self) -> None:
@@ -541,8 +587,28 @@ class DpdkTestpmd(Tool):
         else:
             mellanox_drivers = ["mlx5_core", "mlx5_ib"]
         modprobe = self.node.tools[Modprobe]
-        if isinstance(self.node.os, Debian):
-            modprobe.load("rdma_cm")
+        if isinstance(self.node.os, Ubuntu):
+            # Ubuntu shouldn't need any special casing, skip to loading rdma/ib
+            pass
+        elif isinstance(self.node.os, Debian):
+            # NOTE: debian buster doesn't include rdma and ib drivers
+            # on 5.4 specifically for linux-image-cloud:
+            # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1012639
+            # for backports on this release we should update the kernel to latest
+            kernel_info = self.node.os.get_kernel_information(force_run=True)
+            # update to at least 5.10 (known good for buster linux-image-cloud-(arch))
+            if (
+                self.node.os.information.codename == "buster"
+                and kernel_info.version <= "5.10.0"
+            ):
+                self.node.log.debug(
+                    f"Debian (buster) kernel version found: {str(kernel_info.version)} "
+                    "Updating linux-image-cloud to most recent kernel."
+                )
+                # grab the linux-image package name from kernel version metadata
+                linux_image_package = "linux-image-cloud-[a-zA-Z0-9]*"
+                self.node.os.install_packages([linux_image_package])
+                self.node.reboot()
         elif isinstance(self.node.os, Fedora):
             if not self.is_connect_x3:
                 self.node.execute(
@@ -554,7 +620,6 @@ class DpdkTestpmd(Tool):
                     ),
                     sudo=True,
                 )
-            modprobe.load("mlx4_en")
         else:
             raise UnsupportedDistroException(self.node.os)
         rmda_drivers = ["ib_core", "ib_uverbs", "rdma_ucm"]
@@ -578,7 +643,7 @@ class DpdkTestpmd(Tool):
                 supported = node.os.information.version >= "18.4.0"
             else:
                 supported = node.os.information.version >= "10.0.0"
-        elif isinstance(node.os, Redhat):
+        elif isinstance(node.os, Redhat) and not isinstance(node.os, Oracle):
             supported = node.os.information.version >= "7.5.0"
         elif isinstance(node.os, Suse):
             supported = node.os.information.version >= "15.0.0"
@@ -650,6 +715,12 @@ class DpdkTestpmd(Tool):
             # Add packages for rhel7
             rhel.install_packages(list(["libmnl-devel", "libbpf-devel"]))
 
+        try:
+            rhel.install_packages("kernel-devel-$(uname -r)")
+        except MissingPackagesException:
+            node.log.debug("kernel-devel-$(uname -r) not found. Trying kernel-devel")
+            rhel.install_packages("kernel-devel")
+
         # RHEL 8 doesn't require special cases for installed packages.
         # TODO: RHEL9 may require updates upon release
 
@@ -716,14 +787,10 @@ class DpdkTestpmd(Tool):
             file_path=cwd.as_posix(),
             filename="ninja-linux.zip",
         )
-        node.execute(
-            "unzip ninja-linux.zip",
-            cwd=cwd,
+        node.tools[Unzip].extract(
+            file=str(cwd.joinpath("ninja-linux.zip")),
+            dest_dir=str(cwd),
             sudo=True,
-            expected_exit_code=0,
-            expected_exit_code_failure_message=(
-                "Failed to unzip latest ninja-linux.zip from github."
-            ),
         )
         node.execute(
             "mv ninja /usr/bin/ninja",
@@ -743,6 +810,28 @@ class DpdkTestpmd(Tool):
                 "Could not upgrade pyelftools with pip3."
             ),
         )
+
+    def find_testpmd_binary(
+        self, check_path: str = "", assert_on_fail: bool = True
+    ) -> bool:
+        node = self.node
+        if self._testpmd_install_path:
+            return True
+        for bin_name in ["dpdk-testpmd", "testpmd"]:
+            if check_path:
+                bin_path = PurePosixPath(check_path).joinpath(bin_name)
+                bin_name = str(bin_path)
+            result = node.execute(f"which {bin_name}")
+            if result.exit_code == 0:
+                self._testpmd_install_path = result.stdout.strip()
+                break
+        found_path = PurePosixPath(self._testpmd_install_path)
+        path_check = bool(self._testpmd_install_path) and node.shell.exists(found_path)
+        if assert_on_fail and not path_check:
+            fail("Could not locate testpmd binary after installation!")
+        elif not path_check:
+            self._testpmd_install_path = ""
+        return path_check
 
     def _split_testpmd_output(self) -> None:
         search_str = "Port 0: device removal event"
@@ -818,3 +907,24 @@ def _discard_first_zeroes(data: List[int]) -> List[int]:
 
 def _mean(data: List[int]) -> int:
     return sum(data) // len(data)
+
+
+# Cancellable timeout tool
+def create_async_timeout(node: Node, command: str, timeout: int) -> TaskManager[None]:
+
+    # setup a timer
+    def kill_timer(timeout: int) -> None:
+        timer = create_timer()
+        while timer.elapsed(False) < timeout:
+            pass
+
+    # and killer callback, callback will not run if timer is cancelled
+    def kill_callback(x: None) -> None:
+        node.tools[Kill].by_name(command)
+
+    # initiate async timer
+    kill_manager = run_in_parallel_async(
+        [partial(kill_timer, timeout)], kill_callback, node.log
+    )
+
+    return kill_manager

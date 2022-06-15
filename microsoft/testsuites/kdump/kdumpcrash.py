@@ -1,11 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 import time
-from pathlib import PurePosixPath
+from pathlib import Path
 from random import randint
 from typing import cast
-
-from assertpy import assert_that
 
 from lisa import (
     LisaException,
@@ -21,8 +19,9 @@ from lisa import (
     schema,
     search_space,
 )
+from lisa.features import SerialConsole
 from lisa.operating_system import Redhat
-from lisa.tools import Dmesg, Echo, KdumpBase, Lscpu, Uname
+from lisa.tools import Dmesg, Echo, KdumpBase, KernelConfig, Lscpu
 from lisa.util.perf_timer import create_timer
 from lisa.util.shell import try_connect
 
@@ -31,10 +30,10 @@ from lisa.util.shell import try_connect
     area="kdump",
     category="functional",
     description="""
-    This test suite is used to verify if kernel crash dmup is effect, which is judged
+    This test suite is used to verify if kernel crash dump is effect, which is judged
     through vmcore file is generated after triggering kdump by sysrq.
 
-    It has 7 test cases. They verfy if kdump is effect when:
+    It has 7 test cases. They verify if kdump is effect when:
         1. VM has 1 cpu
         2. VM has 2-8 cpus and trigger kdump on cpu 1
         3. VM has 33-192 cpus and trigger kdump on cpu 32
@@ -54,7 +53,7 @@ class KdumpCrash(TestSuite):
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if kdump is effect when VM has 1 cpu.
+        This test case verifies if kdump is effect when VM has 1 cpu.
         VM need 2G memory at least to make sure it has enough memory to load crash
         kernel.
 
@@ -62,7 +61,7 @@ class KdumpCrash(TestSuite):
         1. Check if vmbus version and kernel configurations support for crash dump.
         2. Specify the memory reserved for crash kernel in kernel cmdline, setting the
             "crashkernel" option to the required value.
-            a. Modify the grub config file to add crashkrenel option or change the
+            a. Modify the grub config file to add crashkernel option or change the
                 value to the required one. (For Redhat 8, no need to modify grub config
                 file. It can specify crashkernel by using grubby command directly)
             b. Update grub config
@@ -84,12 +83,14 @@ class KdumpCrash(TestSuite):
             ),
         ),
     )
-    def kdumpcrash_validate_single_core(self, node: Node, log: Logger) -> None:
-        self._kdump_test(node, log)
+    def kdumpcrash_validate_single_core(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
+        self._kdump_test(node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when VM has 2~8 cpus, and
+        This test case verifies if the kdump is effect when VM has 2~8 cpus, and
         trigger kdump on the second cpu(cpu1), which is designed by a known issue.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
@@ -100,26 +101,28 @@ class KdumpCrash(TestSuite):
             )
         ),
     )
-    def kdumpcrash_validate_smp(self, node: Node, log: Logger) -> None:
-        self._trigger_kdump_on_specified_cpu(1, node, log)
+    def kdumpcrash_validate_smp(self, node: Node, log_path: Path, log: Logger) -> None:
+        self._trigger_kdump_on_specified_cpu(1, node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when VM has any cores, and
+        This test case verifies if the kdump is effect when VM has any cores, and
         trigger kdump on the random cpu.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
         priority=2,
     )
-    def kdumpcrash_validate_on_random_cpu(self, node: Node, log: Logger) -> None:
+    def kdumpcrash_validate_on_random_cpu(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
         lscpu = node.tools[Lscpu]
         cpu_count = lscpu.get_core_count()
         cpu_num = randint(0, cpu_count - 1)
-        self._trigger_kdump_on_specified_cpu(cpu_num, node, log)
+        self._trigger_kdump_on_specified_cpu(cpu_num, node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when VM has 33~192 cpus and
+        This test case verifies if the kdump is effect when VM has 33~192 cpus and
         trigger kdump on the 33th cpu(cpu32), which is designed by a known issue.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
@@ -128,12 +131,14 @@ class KdumpCrash(TestSuite):
             node=schema.NodeSpace(core_count=search_space.IntRange(min=33, max=192))
         ),
     )
-    def kdumpcrash_validate_on_cpu32(self, node: Node, log: Logger) -> None:
-        self._trigger_kdump_on_specified_cpu(32, node, log)
+    def kdumpcrash_validate_on_cpu32(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
+        self._trigger_kdump_on_specified_cpu(32, node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when VM has 193~415 cpus, and
+        This test case verifies if the kdump is effect when VM has 193~415 cpus, and
         trigger kdump on the 193th cpu(cpu192), which is designed by a known issue.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
@@ -142,12 +147,14 @@ class KdumpCrash(TestSuite):
             node=schema.NodeSpace(core_count=search_space.IntRange(min=193, max=415))
         ),
     )
-    def kdumpcrash_validate_on_cpu192(self, node: Node, log: Logger) -> None:
-        self._trigger_kdump_on_specified_cpu(192, node, log)
+    def kdumpcrash_validate_on_cpu192(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
+        self._trigger_kdump_on_specified_cpu(192, node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when VM has more than 415 cpus,
+        This test case verifies if the kdump is effect when VM has more than 415 cpus,
         and trigger kdump on the 416th cpu(cpu415), which is designed by a known issue.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
@@ -156,23 +163,27 @@ class KdumpCrash(TestSuite):
             node=schema.NodeSpace(core_count=search_space.IntRange(min=416))
         ),
     )
-    def kdumpcrash_validate_on_cpu415(self, node: Node, log: Logger) -> None:
-        self._trigger_kdump_on_specified_cpu(415, node, log)
+    def kdumpcrash_validate_on_cpu415(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
+        self._trigger_kdump_on_specified_cpu(415, node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when crashkernel is set auto.
+        This test case verifies if the kdump is effect when crashkernel is set auto.
         The test steps are same as `kdumpcrash_validate_single_core`.
         """,
         priority=2,
     )
-    def kdumpcrash_validate_auto_size(self, node: Node, log: Logger) -> None:
+    def kdumpcrash_validate_auto_size(
+        self, node: Node, log_path: Path, log: Logger
+    ) -> None:
         self.crash_kernel = "auto"
-        self._kdump_test(node, log)
+        self._kdump_test(node, log_path, log)
 
     @TestCaseMetadata(
         description="""
-        This test case verfies if the kdump is effect when crashkernel is set auto and
+        This test case verifies if the kdump is effect when crashkernel is set auto and
         the memory is more than 2T. With the crashkernel=auto parameter, system will
         reserved a suitable size memory for crash kernel. We want to see if the
         crashkernel=auto can also handle this scenario when the system memory is large.
@@ -185,20 +196,10 @@ class KdumpCrash(TestSuite):
         ),
     )
     def kdumpcrash_validate_large_memory_auto_size(
-        self, node: Node, log: Logger
+        self, node: Node, log_path: Path, log: Logger
     ) -> None:
         self.crash_kernel = "auto"
-        self._kdump_test(node, log)
-
-    def _get_boot_config_path(self, node: Node) -> str:
-        uname_tool = node.tools[Uname]
-        kernel_ver = uname_tool.get_linux_information().kernel_version
-        config_path = f"/boot/config-{kernel_ver}"
-        assert_that(node.shell.exists(PurePosixPath(config_path))).described_as(
-            f"/boot/config-{kernel_ver} not exist. "
-            "Please check if the kernel version is right."
-        ).is_true()
-        return config_path
+        self._kdump_test(node, log_path, log)
 
     def _check_supported(self, node: Node) -> None:
         # Check the VMBus version for kdump supported
@@ -216,23 +217,21 @@ class KdumpCrash(TestSuite):
         # CONFIG_KEXEC_AUTO_RESERVE. For version 8, the ifdefine of that config is
         # removed. For these changes we can refer to Centos kernel, gotten according
         # to https://wiki.centos.org/action/show/Sources?action=show&redirect=sources
-        # In addiation, we didn't see upstream kernel has the auto crashkernel feature.
+        # In addition, we didn't see upstream kernel has the auto crashkernel feature.
         # It may be a patch owned by Redhat/Centos.
-        config_path = self._get_boot_config_path(node)
         if not (
             isinstance(node.os, Redhat) and node.os.information.version >= "8.0.0-0"
         ):
-            result = node.execute(
-                f"grep CONFIG_KEXEC_AUTO_RESERVE=y {config_path}", shell=True
-            )
-            if self.crash_kernel == "auto" and result.exit_code != 0:
+            if self.crash_kernel == "auto" and not node.tools[KernelConfig].is_built_in(
+                "CONFIG_KEXEC_AUTO_RESERVE"
+            ):
                 raise SkippedException("crashkernel=auto doesn't work for the distro.")
 
         # Check the kernel config for kdump supported
         kdump = node.tools[KdumpBase]
-        kdump.check_required_kernel_config(config_path)
+        kdump.check_required_kernel_config()
 
-    def _kdump_test(self, node: Node, log: Logger) -> None:
+    def _kdump_test(self, node: Node, log_path: Path, log: Logger) -> None:
         try:
             self._check_supported(node)
         except UnsupportedDistroException as identifier:
@@ -273,7 +272,7 @@ class KdumpCrash(TestSuite):
 
         # Wait for the VM dump file and boot up
         # When the crash kernel boots up, port 22 can be connected even if dump file
-        # is not completed. So we cann't use wait_tcp_port_ready function to judge if
+        # is not completed. So we can't use wait_tcp_port_ready function to judge if
         # the dump process is completed and the VM already boots up. We can use
         # try_connect function
         timer = create_timer()
@@ -290,6 +289,11 @@ class KdumpCrash(TestSuite):
                     f"{identifier.__class__.__name__}: {identifier}. Retry..."
                 )
                 time.sleep(10)
+            if not stdout:
+                serial_console = node.features[SerialConsole]
+                serial_console.check_initramfs(
+                    saved_path=log_path, stage="after_trigger_crash", force_run=True
+                )
         if not stdout:
             raise LisaException("Timeout to connect the VM after triggering kdump.")
 
@@ -300,7 +304,7 @@ class KdumpCrash(TestSuite):
         kdump.check_vmcore_exist()
 
     def _trigger_kdump_on_specified_cpu(
-        self, cpu_num: int, node: Node, log: Logger
+        self, cpu_num: int, node: Node, log_path: Path, log: Logger
     ) -> None:
         lscpu = node.tools[Lscpu]
         cpu_count = lscpu.get_core_count()
@@ -308,7 +312,7 @@ class KdumpCrash(TestSuite):
             self.trigger_kdump_cmd = (
                 f"taskset -c {cpu_num} echo c > /proc/sysrq-trigger"
             )
-            self._kdump_test(node, log)
+            self._kdump_test(node, log_path, log)
         else:
             raise SkippedException(
                 "The cpu count can't meet the test case's requirement. "

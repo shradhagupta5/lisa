@@ -95,6 +95,10 @@ class AzureNodeSchema:
     # It decides the real computer name. It cannot be too long.
     short_name: str = ""
     vm_size: str = ""
+    # Force to maximize capability of the vm size. It bypass requirements on
+    # test cases, and uses to force run performance tests on any vm size.
+    maximize_capability: bool = False
+
     location: str = ""
     # Required by shared gallery images which are present in
     # subscription different from where LISA is run
@@ -423,7 +427,7 @@ def get_storage_account_name(
     subscription_id: str, location: str, type: str = "s"
 ) -> str:
     subscription_id_postfix = subscription_id[-8:]
-    # name should be shorter than 24 charactor
+    # name should be shorter than 24 character
     return f"lisa{type}{location[0:11]}{subscription_id_postfix}"
 
 

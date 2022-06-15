@@ -286,7 +286,7 @@ class Posix(OperatingSystem, BaseClassMixin):
     #   Distributor ID:	Scientific
     #   Description:	Scientific Linux release 6.7 (Carbon)
     # In most of the distros, the text in the brackets is the codename.
-    # This regex gets the codename for the ditsro
+    # This regex gets the codename for the distro
     _distro_codename_pattern = re.compile(r"^.*\(([^)]+)")
 
     def __init__(self, node: Any) -> None:
@@ -322,7 +322,7 @@ class Posix(OperatingSystem, BaseClassMixin):
     def install_packages(
         self,
         packages: Union[str, Tool, Type[Tool], List[Union[str, Tool, Type[Tool]]]],
-        signed: bool = True,
+        signed: bool = False,
         timeout: int = 600,
         extra_args: Optional[List[str]] = None,
     ) -> None:
@@ -735,6 +735,7 @@ class Debian(Linux):
                 key_file_path = wget.get(
                     url=key_location,
                     file_path=str(self._node.working_path),
+                    force_run=True,
                 )
                 self._node.execute(
                     cmd=f"apt-key add {key_file_path}",
@@ -1131,6 +1132,11 @@ class RPMDistro(Linux):
 
         return False
 
+    def _is_package_in_repo(self, package: str) -> bool:
+        command = f"{self._dnf_tool()} list {package} -y"
+        result = self._node.execute(command, sudo=True, shell=True)
+        return 0 == result.exit_code
+
     def _dnf_tool(self) -> str:
         return "dnf"
 
@@ -1311,6 +1317,9 @@ class Redhat(Fedora):
         return False
 
     def _is_package_in_repo(self, package: str) -> bool:
+        if self._first_time_installation:
+            self._initialize_package_installation()
+            self._first_time_installation = False
         command = f"yum --showduplicates list {package}"
         result = self._node.execute(command, sudo=True, shell=True)
         return 0 == result.exit_code
@@ -1385,6 +1394,21 @@ class CentOs(Redhat):
             saved_path / "centos-release.txt",
         )
 
+    def _initialize_package_installation(self) -> None:
+        information = self._get_information()
+        if 8 == information.version.major:
+            # refer https://www.centos.org/centos-linux-eol/
+            # CentOS 8 is EOL, old repo mirror was moved to vault.centos.org
+            # CentOS-AppStream.repo, CentOS-Base.repo may contain non-existed repo
+            # use skip_if_unavailable to aviod installation issues bring in by above
+            #  issue
+            cmd_results = self._node.execute("yum repolist -v", sudo=True)
+            if 0 != cmd_results.exit_code:
+                cmd_results = self._node.execute(
+                    "yum-config-manager --save --setopt=skip_if_unavailable=true",
+                    sudo=True,
+                )
+
 
 class Oracle(Redhat):
     @classmethod
@@ -1404,7 +1428,7 @@ class CBLMariner(RPMDistro):
         self._dnf_tool_name: str
 
     def _initialize_package_installation(self) -> None:
-        result = self._node.execute("command -v dnf", no_info_log=True)
+        result = self._node.execute("command -v dnf", no_info_log=True, shell=True)
         if result.exit_code == 0:
             self._dnf_tool_name = "dnf"
             return

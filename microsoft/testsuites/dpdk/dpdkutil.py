@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any, Dict, List, Tuple, Union
 
 from assertpy import assert_that, fail
+from semver import VersionInfo
 
 from lisa import (
     Environment,
@@ -17,12 +18,46 @@ from lisa import (
     constants,
 )
 from lisa.features import NetworkInterface
-from lisa.nic import NicInfo, Nics
+from lisa.nic import NicInfo
+from lisa.operating_system import OperatingSystem
 from lisa.tools import Dmesg, Echo, Lsmod, Lspci, Modprobe, Mount
 from lisa.tools.mkfs import FileSystem
 from lisa.util import perf_timer
 from lisa.util.parallel import TaskManager, run_in_parallel, run_in_parallel_async
 from microsoft.testsuites.dpdk.dpdktestpmd import PACKAGE_MANAGER_SOURCE, DpdkTestpmd
+
+
+# DPDK added new flags in 19.11 that some tests rely on for send/recv
+# Adding an exception so we don't have to catch all LisaExceptions
+class UnsupportedPackageVersionException(LisaException):
+    """
+    Exception to indicate that a required package does not support a
+    feature or function needed for a specific test.
+    """
+
+    def __init__(
+        self,
+        os: "OperatingSystem",
+        package_name: str,
+        package_version: VersionInfo,
+        missing_feature: str,
+        message: str = "",
+    ) -> None:
+        self.name = os.name
+        self.version = os.information.full_version
+        self._extended_message = message
+        self.package_info = f"{package_name}: {str(package_version)}"
+        self.missing_feature = missing_feature
+
+    def __str__(self) -> str:
+        message = (
+            f"Detected incompatible package on: '{self.version}'."
+            f"Package {self.package_info} does not support an operation "
+            f"required for this test: {self.missing_feature}"
+        )
+        if self._extended_message:
+            message = f"{message}. {self._extended_message}"
+        return message
 
 
 class DpdkTestResources:
@@ -35,9 +70,9 @@ class DpdkTestResources:
         test_nic = self.node.nics.get_nic_by_index()
         # generate hotplug pattern for this specific nic
         self.vf_hotplug_regex = re.compile(
-            f"{test_nic.upper}: Data path switched to VF: {test_nic.lower}"
+            f"{test_nic.upper}: Data path switched to VF:"
         )
-        self.vf_slot_removal_regex = re.compile(f"VF unregistering: {test_nic.lower}")
+        self.vf_slot_removal_regex = re.compile(f"{test_nic.upper}: VF unregistering:")
 
     def wait_for_dmesg_output(self, wait_for: str, timeout: int) -> bool:
         search_pattern = None
@@ -135,23 +170,8 @@ def generate_send_receive_run_info(
     return kit_cmd_pairs
 
 
-def bind_nic_to_dpdk_pmd(nics: Nics, nic: NicInfo, pmd: str) -> None:
-    current_driver = nics.get_nic_driver(nic.upper)
-    if pmd == "netvsc":
-        if current_driver == "uio_hv_generic":
-            return
-        # bind_dev_to_new_driver
-        nics.unbind(nic, current_driver)
-        nics.bind(nic, "uio_hv_generic")
-        nic.bound_driver = "uio_hv_generic"
-    elif pmd == "failsafe":
-        if current_driver == "hv_netvsc":
-            return
-        nics.unbind(nic, current_driver)
-        nics.bind(nic, "hv_netvsc")
-        nic.bound_driver = "hv_netvsc"
-    else:
-        fail(f"Unrecognized pmd {pmd} passed to test init procedure.")
+UIO_HV_GENERIC_SYSFS_PATH = "/sys/bus/vmbus/drivers/uio_hv_generic"
+HV_NETVSC_SYSFS_PATH = "/sys/bus/vmbus/drivers/hv_netvsc"
 
 
 def enable_uio_hv_generic_for_nic(node: Node, nic: NicInfo) -> None:
@@ -202,8 +222,6 @@ def initialize_node_resources(
     # dump some info about the pci devices before we start
     lspci = node.tools[Lspci]
     log.info(f"Node[{node.name}] LSPCI Info:\n{lspci.run().stdout}\n")
-    # init and enable hugepages (required by dpdk)
-    init_hugepages(node)
 
     # initialize testpmd tool (installs dpdk)
     testpmd = DpdkTestpmd(node)
@@ -216,18 +234,43 @@ def initialize_node_resources(
         # forward message from distro exception
         raise SkippedException(err)
 
+    # init and enable hugepages (required by dpdk)
+    init_hugepages(node)
+
     assert_that(len(node.nics)).described_as(
         "Test needs at least 1 NIC on the test node."
     ).is_greater_than_or_equal_to(1)
 
-    nic_to_bind = node.nics.get_nic_by_index()
+    test_nic = node.nics.get_nic_by_index()
+
+    # check an assumption that our nics are bound to hv_netvsc
+    # at test start.
+
+    assert_that(test_nic.bound_driver).described_as(
+        f"Error: Expected test nic {test_nic.upper} to be "
+        f"bound to hv_netvsc. Found {test_nic.bound_driver}."
+    ).is_equal_to("hv_netvsc")
 
     # netvsc pmd requires uio_hv_generic to be loaded before use
     if pmd == "netvsc":
-        enable_uio_hv_generic_for_nic(node, nic_to_bind)
+        enable_uio_hv_generic_for_nic(node, test_nic)
+        # if this device is paired, set the upper device 'down'
+        if test_nic.lower:
+            node.nics.unbind(test_nic)
+            node.nics.bind(test_nic, UIO_HV_GENERIC_SYSFS_PATH)
 
-    bind_nic_to_dpdk_pmd(node.nics, nic_to_bind, pmd)
     return DpdkTestResources(node, testpmd)
+
+
+def check_send_receive_compatibility(test_kits: List[DpdkTestResources]) -> None:
+    for kit in test_kits:
+        if not kit.testpmd.has_tx_ip_flag():
+            raise UnsupportedPackageVersionException(
+                kit.node.os,
+                "dpdk",
+                kit.testpmd.get_dpdk_version(),
+                "-tx-ip flag for ip forwarding",
+            )
 
 
 def run_testpmd_concurrent(
@@ -244,7 +287,7 @@ def run_testpmd_concurrent(
 
         # disable sriov
         for node_resources in test_kits:
-            node_resources.nic_controller.switch_sriov(enable=False)
+            node_resources.nic_controller.switch_sriov(enable=False, wait=False)
 
         # wait for disable to hit the vm
         for node_resources in test_kits:
@@ -258,7 +301,7 @@ def run_testpmd_concurrent(
 
         # re-enable sriov
         for node_resources in test_kits:
-            node_resources.nic_controller.switch_sriov(enable=True)
+            node_resources.nic_controller.switch_sriov(enable=True, wait=False)
 
         # wait for re-enable to hit vms
         for node_resources in test_kits:
@@ -368,7 +411,11 @@ def verify_dpdk_send_receive(
     log.debug((f"\nsender:{external_ips[0]}\nreceiver:{external_ips[1]}\n"))
 
     test_kits = init_nodes_concurrent(environment, log, variables, pmd)
+
+    check_send_receive_compatibility(test_kits)
+
     sender, receiver = test_kits
+
     kit_cmd_pairs = generate_send_receive_run_info(
         pmd, sender, receiver, core_count=core_count
     )
@@ -400,6 +447,9 @@ def verify_dpdk_send_receive_multi_txrx_queue(
 ) -> Tuple[DpdkTestResources, DpdkTestResources]:
 
     test_kits = init_nodes_concurrent(environment, log, variables, pmd)
+
+    check_send_receive_compatibility(test_kits)
+
     sender, receiver = test_kits
 
     kit_cmd_pairs = generate_send_receive_run_info(

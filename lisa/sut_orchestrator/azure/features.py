@@ -24,7 +24,6 @@ from PIL import Image, UnidentifiedImageError
 from retry import retry
 
 from lisa import Environment, Logger, features, schema, search_space
-from lisa.features import NvmeSettings
 from lisa.features.gpu import ComputeSDK
 from lisa.features.resize import ResizeAction
 from lisa.node import Node, RemoteNode
@@ -277,7 +276,7 @@ class NetworkInterface(AzureFeatureMixin, features.NetworkInterface):
         super()._initialize(*args, **kwargs)
         self._initialize_information(self._node)
 
-    def switch_sriov(self, enable: bool) -> None:
+    def switch_sriov(self, enable: bool, wait: bool = True) -> None:
         azure_platform: AzurePlatform = self._platform  # type: ignore
         network_client = get_network_client(azure_platform)
         vm = get_vm(azure_platform, self._node)
@@ -314,7 +313,8 @@ class NetworkInterface(AzureFeatureMixin, features.NetworkInterface):
                 ).is_equal_to(enable)
 
         # wait settings effective
-        self._check_sriov_enabled(enable)
+        if wait:
+            self._check_sriov_enabled(enable)
 
     def is_enabled_sriov(self) -> bool:
         azure_platform: AzurePlatform = self._platform  # type: ignore
@@ -488,16 +488,6 @@ class NetworkInterface(AzureFeatureMixin, features.NetworkInterface):
                 )
             )
         return all_nics
-
-
-class Nvme(AzureFeatureMixin, features.Nvme):
-    @classmethod
-    def settings_type(cls) -> Type[schema.FeatureSettings]:
-        return NvmeSettings
-
-    def _initialize(self, *args: Any, **kwargs: Any) -> None:
-        super()._initialize(*args, **kwargs)
-        self._initialize_information(self._node)
 
 
 # Tuple: (IOPS, Disk Size)
@@ -774,7 +764,12 @@ class Disk(AzureFeatureMixin, features.Disk):
             "ls -d /dev/disk/azure/scsi1/*", shell=True, sudo=True
         )
         matched = find_patterns_in_lines(cmd_result.stdout, [pattern])
-        assert matched[0]
+        # https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-device-names-problems#get-the-latest-azure-storage-rules  # noqa: E501
+        assert matched[0], (
+            "no data disks found under folder /dev/disk/azure/scsi1/,"
+            " please check data disks exist or not, also check udev"
+            " rule which is to construct a set of symbolic links exist or not"
+        )
         matched_disk_array = set(matched[0])
         disk_array: List[str] = [""] * len(matched_disk_array)
         for disk in matched_disk_array:

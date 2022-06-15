@@ -39,6 +39,7 @@ from dataclasses_json import dataclass_json
 from marshmallow import fields, validate
 from retry import retry
 
+import lisa.features as base_features
 from lisa import feature, schema, search_space
 from lisa.environment import Environment
 from lisa.features import NvmeSettings
@@ -322,7 +323,7 @@ class AzurePlatform(Platform):
         return [
             features.Disk,
             features.Gpu,
-            features.Nvme,
+            base_features.Nvme,
             features.SerialConsole,
             features.NetworkInterface,
             features.Resize,
@@ -330,6 +331,7 @@ class AzurePlatform(Platform):
             features.Infiniband,
             features.Hibernation,
             features.SecurityProfile,
+            base_features.ACC,
         ]
 
     def _prepare_environment(  # noqa: C901
@@ -373,7 +375,7 @@ class AzurePlatform(Platform):
                 )
                 if node_runbook.location:
                     if existing_location:
-                        # if any one has different location, calculate again
+                        # if any one has different location, raise an exception.
                         if existing_location != node_runbook.location:
                             raise LisaException(
                                 f"predefined node must be in same location, "
@@ -417,6 +419,14 @@ class AzurePlatform(Platform):
                             matched_cap = azure_cap
                             matched_score = matcher.ratio()
                     if matched_cap:
+                        # If max capability is set, use the max capability,
+                        # instead of the real capability. It needs to be in the
+                        # loop, to find supported locations.
+                        if node_runbook.maximize_capability:
+                            matched_cap = self._generate_max_capability(
+                                node_runbook.vm_size, location_name
+                            )
+
                         predefined_cost += matched_cap.estimated_cost
 
                         min_cap = self._generate_min_capability(
@@ -446,7 +456,7 @@ class AzurePlatform(Platform):
                         f"Cannot find vm_size {node_runbook.vm_size} in {location}. "
                         f"Mockup capability to run tests."
                     )
-                    mock_up_capability = self._generate_mockup_capability(
+                    mock_up_capability = self._generate_max_capability(
                         node_runbook.vm_size, location
                     )
                     min_cap = self._generate_min_capability(
@@ -1154,17 +1164,19 @@ class AzurePlatform(Platform):
         )
 
         if not azure_node_runbook.name:
-            # the max length of vm name is 64 chars. Below logic takes last 40
-            # chars in resource group name and keep the leading "lisa-". So it's
-            # easy to identify it's a lisa created node.
-            azure_node_runbook.name = truncate_keep_prefix(
-                f"{name_prefix}-n{index}", 50
-            )
-            # It's used as computer name only. Windows doesn't support name more
-            # than 15 chars
-            azure_node_runbook.short_name = truncate_keep_prefix(
-                azure_node_runbook.name, 15
-            )
+            # the max length of vm name is 64 chars. Below logic takes last 45
+            # chars in resource group name and keep the leading 5 chars.
+            # name_prefix can contain any of customized (existing) or
+            # generated (starts with "lisa-") resource group name,
+            # so, pass the first 5 chars as prefix to truncate_keep_prefix
+            # to handle both cases
+            node_name = f"{name_prefix}-n{index}"
+            azure_node_runbook.name = truncate_keep_prefix(node_name, 50, node_name[:5])
+        # It's used as computer name only. Windows doesn't support name more
+        # than 15 chars
+        azure_node_runbook.short_name = truncate_keep_prefix(
+            azure_node_runbook.name, 15, azure_node_runbook.name[:5]
+        )
         if not azure_node_runbook.vm_size:
             raise LisaException("vm_size is not detected before deploy")
         if not azure_node_runbook.location:
@@ -1615,6 +1627,14 @@ class AzurePlatform(Platform):
         else:
             node_space.core_count = vcpus
 
+        # add acc feature if it's supported
+        if resource_sku.family in ["standardDCSv2Family", "standardDCSv3Family"]:
+            node_space.features.update(
+                [
+                    schema.FeatureSettings.create(base_features.ACC.name()),
+                ]
+            )
+
         if resource_sku.family in ["standardLSv2Family"]:
             # refer https://docs.microsoft.com/en-us/azure/virtual-machines/lsv2-series # noqa: E501
             # NVMe disk count = vCPU / 8
@@ -1786,9 +1806,7 @@ class AzurePlatform(Platform):
 
         return plan
 
-    def _generate_mockup_capability(
-        self, vm_size: str, location: str
-    ) -> AzureCapability:
+    def _generate_max_capability(self, vm_size: str, location: str) -> AzureCapability:
 
         # some vm size cannot be queried from API, so use default capability to
         # run with best guess on capability.
@@ -1831,13 +1849,9 @@ class AzurePlatform(Platform):
         )
 
         # all nodes support following features
+        all_features = self.supported_features()
         node_space.features.update(
-            [
-                schema.FeatureSettings.create(features.Nvme.name()),
-                schema.FeatureSettings.create(features.Gpu.name()),
-                schema.FeatureSettings.create(features.StartStop.name()),
-                schema.FeatureSettings.create(features.SerialConsole.name()),
-            ]
+            [schema.FeatureSettings.create(x.name()) for x in all_features]
         )
         _convert_to_azure_node_space(node_space)
 

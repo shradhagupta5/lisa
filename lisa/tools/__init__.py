@@ -31,6 +31,7 @@ from .interrupt_inspector import InterruptInspector
 from .ip import Ip
 from .iperf3 import Iperf3
 from .kdump import KdumpBase
+from .kernel_config import KernelConfig
 from .kill import Kill
 from .lagscope import Lagscope
 from .ls import Ls
@@ -58,6 +59,7 @@ from .nvidiasmi import NvidiaSmi
 from .nvmecli import Nvmecli
 from .parted import Parted
 from .pgrep import Pgrep, ProcessInfo
+from .pidof import Pidof
 from .ping import Ping
 from .powershell import PowerShell
 from .python import Pip, Python
@@ -78,6 +80,7 @@ from .sysctl import Sysctl
 from .tar import Tar
 from .taskset import TaskSet
 from .tcpdump import TcpDump
+from .texinfo import Texinfo
 from .timedatectl import Timedatectl
 from .unzip import Unzip
 from .uptime import Uptime
@@ -120,6 +123,7 @@ __all__ = [
     "Iperf3",
     "Iptables",
     "KdumpBase",
+    "KernelConfig",
     "Kill",
     "Lagscope",
     "Ls",
@@ -148,6 +152,7 @@ __all__ = [
     "NvidiaSmi",
     "Nvmecli",
     "Parted",
+    "Pidof",
     "Pgrep",
     "Ping",
     "Pip",
@@ -172,6 +177,7 @@ __all__ = [
     "Sysctl",
     "Tar",
     "TaskSet",
+    "Texinfo",
     "TcpDump",
     "Timedatectl",
     "Uname",
